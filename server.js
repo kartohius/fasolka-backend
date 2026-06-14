@@ -57,37 +57,58 @@ function broadcast(payload) {
 /* ── VK WebSocket ── */
 async function getVkWsUrl(token) {
   const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
-  const r = await fetch(`${VK_API}/blog/${VK_CHANNEL}/public_video_stream`, { headers });
-  if (!r.ok) throw new Error(`VK API ${r.status}`);
-  const data = await r.json();
 
-  const d = Array.isArray(data?.data) ? data.data[0] : data;
-  const url = d?.chatSettings?.webSocketChannels?.chat
-           || d?.webSocketChannels?.chat
-           || d?.chatSettings?.chatUrl
-           || null;
+  // Пробуем несколько эндпоинтов — VK меняет структуру ответа
+  const endpoints = [
+    `${VK_API}/blog/${VK_CHANNEL}/public_video_stream`,
+    `${VK_API}/blog/${VK_CHANNEL}/channel`,
+  ];
 
-  if (!url) {
-    log('VK API response:', JSON.stringify(data).slice(0, 600));
-    throw new Error('WebSocket URL не найден');
+  for (const endpoint of endpoints) {
+    try {
+      const r = await fetch(endpoint, { headers });
+      if (!r.ok) continue;
+      const data = await r.json();
+      log('VK API response from', endpoint, ':', JSON.stringify(data).slice(0, 400));
+
+      // Ищем WS URL во всех известных местах структуры
+      const candidates = [data, data?.data?.[0], data?.data, data?.channel, data?.stream]
+        .filter(Boolean);
+
+      for (const d of candidates) {
+        const url = d?.chatSettings?.webSocketChannels?.chat
+                 || d?.webSocketChannels?.chat
+                 || d?.chatSettings?.chatUrl
+                 || d?.wsUrl
+                 || d?.websocketUrl
+                 || null;
+        if (url) return url;
+      }
+    } catch(e) {
+      log('Endpoint error:', endpoint, e.message);
+    }
   }
-  return url;
+
+  // Если стрим офлайн — VK не даёт WS URL.
+  // Возвращаем null вместо ошибки — будем повторять попытки тихо.
+  log('WS URL not found — stream may be offline, will retry');
+  return null;
 }
 
 async function connectVkWs(token) {
   if (vkRetryTimer) { clearTimeout(vkRetryTimer); vkRetryTimer = null; }
   if (vkWs) { try { vkWs.terminate(); } catch(e) {} vkWs = null; }
 
-  try {
-    vkWsUrl = await getVkWsUrl(token);
-  } catch(e) {
-    log('WS URL error:', e.message);
-    broadcast({ type: 'STATUS', status: 'error', message: e.message });
-    scheduleReconnect(token);
+  const url = await getVkWsUrl(token).catch(e => { log('getVkWsUrl error:', e.message); return null; });
+
+  if (!url) {
+    // Стрим офлайн — повторяем через 30 сек, не показываем ошибку
+    broadcast({ type: 'STATUS', status: 'offline', message: 'Стрим офлайн — чат будет доступен во время трансляции' });
+    vkRetryTimer = setTimeout(() => connectVkWs(token), 30000);
     return;
   }
 
-  let wsUrl = vkWsUrl;
+  vkWsUrl = url;
   if (token) wsUrl += (wsUrl.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 
   log('VK WS connecting:', wsUrl.split('?')[0]);
