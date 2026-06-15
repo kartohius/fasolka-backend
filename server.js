@@ -320,6 +320,17 @@ wss.on('connection', (ws, req) => {
   ws.on('error', () => clients.delete(ws));
 });
 
+/* ── DEBUG — показывает сырой ответ VK API ── */
+app.get('/debug/vkapi', async (req, res) => {
+  try {
+    const r = await fetch(`${VK_API}/blog/${VK_CHANNEL}/public_video_stream`);
+    const data = await r.json();
+    res.json({ status: r.status, data });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 /* ── HEALTHCHECK ── */
 app.get('/health', (req, res) => {
   res.json({
