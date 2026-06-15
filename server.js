@@ -54,85 +54,121 @@ function broadcast(payload) {
   }
 }
 
-/* ── VK WebSocket ── */
-async function getVkWsUrl(token) {
-  const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+/* ── VK WebSocket (Centrifugo) ── */
+async function getVkStreamData(token) {
+  const headers = { 'User-Agent': 'Mozilla/5.0' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
 
-  // Пробуем несколько эндпоинтов — VK меняет структуру ответа
-  const endpoints = [
-    `${VK_API}/blog/${VK_CHANNEL}/public_video_stream`,
-    `${VK_API}/blog/${VK_CHANNEL}/channel`,
-  ];
+  const r = await fetch(`${VK_API}/blog/${VK_CHANNEL}/public_video_stream`, { headers });
+  if (!r.ok) throw new Error(`VK API ${r.status}`);
+  const data = await r.json();
 
-  for (const endpoint of endpoints) {
-    try {
-      const r = await fetch(endpoint, { headers });
-      if (!r.ok) continue;
-      const data = await r.json();
-      log('VK API response from', endpoint, ':', JSON.stringify(data).slice(0, 400));
+  // Реальная структура ответа (из debug):
+  // wsChatChannel: "channel-chat:2960797"
+  // isOnline: true
+  const chatChannel = data?.wsChatChannel || data?.wsChatSlotChannel;
+  if (!chatChannel) throw new Error('wsChatChannel не найден в ответе API');
 
-      // Ищем WS URL во всех известных местах структуры
-      const candidates = [data, data?.data?.[0], data?.data, data?.channel, data?.stream]
-        .filter(Boolean);
-
-      for (const d of candidates) {
-        const url = d?.chatSettings?.webSocketChannels?.chat
-                 || d?.webSocketChannels?.chat
-                 || d?.chatSettings?.chatUrl
-                 || d?.wsUrl
-                 || d?.websocketUrl
-                 || null;
-        if (url) return url;
-      }
-    } catch(e) {
-      log('Endpoint error:', endpoint, e.message);
+  // Получаем WS токен через /ws/connect
+  let wsToken = null;
+  try {
+    const wsHeaders = { 'Content-Type': 'application/json' };
+    if (token) wsHeaders['Authorization'] = `Bearer ${token}`;
+    const wsRes = await fetch(`${VK_API}/ws/connect`, {
+      method: 'POST',
+      headers: wsHeaders,
+      body: JSON.stringify({ channels: [chatChannel] }),
+    });
+    if (wsRes.ok) {
+      const wsData = await wsRes.json();
+      wsToken = wsData?.token || wsData?.data?.token;
+      log('WS token:', wsToken ? 'obtained' : 'not found', '| status:', wsRes.status);
+    } else {
+      log('WS token endpoint status:', wsRes.status);
     }
-  }
+  } catch(e) { log('WS token error:', e.message); }
 
-  // Если стрим офлайн — VK не даёт WS URL.
-  // Возвращаем null вместо ошибки — будем повторять попытки тихо.
-  log('WS URL not found — stream may be offline, will retry');
-  return null;
+  return { chatChannel, wsToken, isOnline: !!data?.isOnline, viewers: data?.count?.viewers };
 }
 
 async function connectVkWs(token) {
   if (vkRetryTimer) { clearTimeout(vkRetryTimer); vkRetryTimer = null; }
   if (vkWs) { try { vkWs.terminate(); } catch(e) {} vkWs = null; }
 
-  const url = await getVkWsUrl(token).catch(e => { log('getVkWsUrl error:', e.message); return null; });
-
-  if (!url) {
-    // Стрим офлайн — повторяем через 30 сек, не показываем ошибку
-    broadcast({ type: 'STATUS', status: 'offline', message: 'Стрим офлайн — чат будет доступен во время трансляции' });
+  let sd;
+  try { sd = await getVkStreamData(token); }
+  catch(e) {
+    log('getVkStreamData error:', e.message);
+    broadcast({ type: 'STATUS', status: 'offline', message: e.message });
     vkRetryTimer = setTimeout(() => connectVkWs(token), 30000);
     return;
   }
 
-  vkWsUrl = url;
-  if (token) wsUrl += (wsUrl.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
+  if (!sd.isOnline) {
+    log('Stream offline');
+    broadcast({ type: 'STATUS', status: 'offline', message: 'Стрим офлайн · чат будет доступен во время трансляции' });
+    vkRetryTimer = setTimeout(() => connectVkWs(token), 30000);
+    return;
+  }
 
-  log('VK WS connecting:', wsUrl.split('?')[0]);
+  log('Connecting to Centrifugo, channel:', sd.chatChannel, 'viewers:', sd.viewers);
   broadcast({ type: 'STATUS', status: 'connecting' });
 
-  vkWs = new WebSocket(wsUrl);
+  vkWs = new WebSocket('wss://centrifugo.live.vkvideo.ru/connection/websocket');
 
   vkWs.on('open', () => {
-    log('VK WS connected');
+    log('Centrifugo connected');
     vkRetry = 0;
-    broadcast({ type: 'STATUS', status: 'connected' });
+    // Подключаемся к Centrifugo с токеном (если есть) или без
+    vkWs.send(JSON.stringify({
+      id: 1,
+      connect: sd.wsToken ? { token: sd.wsToken } : {},
+    }));
   });
 
   vkWs.on('message', (raw) => {
-    try { handleVkMessage(JSON.parse(raw.toString())); } catch(e) {}
+    try {
+      const msg = JSON.parse(raw.toString());
+      log('WS msg:', JSON.stringify(msg).slice(0, 200));
+
+      // Ответ на connect → подписываемся на канал чата
+      if (msg.id === 1 && msg.connect !== undefined) {
+        vkWs.send(JSON.stringify({ id: 2, subscribe: { channel: sd.chatChannel } }));
+        broadcast({ type: 'STATUS', status: 'connected' });
+        return;
+      }
+
+      // Ответ на subscribe → история сообщений
+      if (msg.id === 2 && msg.subscribe !== undefined) {
+        log('Subscribed to', sd.chatChannel);
+        const pubs = msg.subscribe?.publications || [];
+        const messages = pubs.map(p => parseMsg(p?.data)).filter(Boolean);
+        if (messages.length) broadcast({ type: 'HISTORY', messages });
+        return;
+      }
+
+      // Входящее сообщение чата (push)
+      if (msg.push) {
+        const pub = msg.push?.pub || msg.push?.message;
+        if (pub?.data) {
+          const parsed = parseMsg(pub.data);
+          if (parsed) broadcast({ type: 'MESSAGE', message: parsed });
+        }
+        return;
+      }
+
+      // Fallback — старый формат
+      handleVkMessage(msg);
+    } catch(e) { log('WS parse error:', e.message); }
   });
 
   vkWs.on('close', (code) => {
-    log(`VK WS closed: ${code}`);
+    log('Centrifugo closed:', code);
     broadcast({ type: 'STATUS', status: 'reconnecting' });
     scheduleReconnect(token);
   });
 
-  vkWs.on('error', (e) => log('VK WS error:', e.message));
+  vkWs.on('error', (e) => log('Centrifugo error:', e.message));
 }
 
 function scheduleReconnect(token) {
