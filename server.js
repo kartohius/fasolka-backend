@@ -54,7 +54,11 @@ function broadcast(payload) {
   }
 }
 
-/* ── VK WebSocket (Centrifugo) ── */
+/* ── VK Stream Data ── 
+   Centrifugo недоступен с Railway (гео/DNS блокировка).
+   Решение: сервер только получает chatChannel из VK API
+   и отдаёт его браузеру. Браузер сам подключается к Centrifugo.
+*/
 async function getVkStreamData(token) {
   const headers = { 'User-Agent': 'Mozilla/5.0' };
   if (token) headers['Authorization'] = `Bearer ${token}`;
@@ -63,135 +67,51 @@ async function getVkStreamData(token) {
   if (!r.ok) throw new Error(`VK API ${r.status}`);
   const data = await r.json();
 
-  // Из debug: wsChatChannel = "channel-chat:2960797"
   const chatChannel = data?.wsChatChannel;
   if (!chatChannel) throw new Error('wsChatChannel не найден');
 
-  // Получаем JWT токен для Centrifugo
-  // VK отдаёт его через /v1/ws/connect (POST)
-  let wsToken = null;
-  try {
-    const wsHeaders = { 'Content-Type': 'application/json' };
-    if (token) wsHeaders['Authorization'] = `Bearer ${token}`;
-
-    // Пробуем несколько эндпоинтов
-    const tokenEndpoints = [
-      `${VK_API}/ws/connect`,
-      `${VK_API}/centrifugo/token`,
-      `${VK_API}/user/public_websocket_token`,
-    ];
-
-    for (const ep of tokenEndpoints) {
-      try {
-        const res = await fetch(ep, {
-          method: 'POST',
-          headers: wsHeaders,
-          body: JSON.stringify({ channels: [chatChannel] }),
-        });
-        log('Token endpoint', ep, 'status:', res.status);
-        if (res.ok) {
-          const d = await res.json();
-          wsToken = d?.token || d?.data?.token || d?.wsToken;
-          if (wsToken) { log('Got WS token from', ep); break; }
-        }
-      } catch(e) { log('Token ep error:', ep, e.message); }
-    }
-  } catch(e) { log('WS token error:', e.message); }
-
   return {
     chatChannel,
-    wsToken,
     isOnline: !!data?.isOnline,
-    viewers: data?.count?.viewers,
+    viewers:  data?.count?.viewers || 0,
   };
 }
 
+// Храним последние данные стрима
+let lastStreamData = null;
+
+async function refreshStreamData(token) {
+  try {
+    lastStreamData = await getVkStreamData(token);
+    log('Stream data:', lastStreamData.isOnline ? 'ONLINE' : 'OFFLINE', 
+        'channel:', lastStreamData.chatChannel,
+        'viewers:', lastStreamData.viewers);
+    
+    // Отправляем channel клиентам чтобы они могли подключиться сами
+    broadcast({ 
+      type: 'STREAM_DATA', 
+      chatChannel: lastStreamData.chatChannel,
+      isOnline: lastStreamData.isOnline,
+      viewers: lastStreamData.viewers,
+    });
+
+    if (lastStreamData.isOnline) {
+      broadcast({ type: 'STATUS', status: 'connected' });
+    } else {
+      broadcast({ type: 'STATUS', status: 'offline', message: 'Стрим офлайн' });
+    }
+  } catch(e) {
+    log('refreshStreamData error:', e.message);
+    broadcast({ type: 'STATUS', status: 'error', message: e.message });
+  }
+  // Обновляем каждые 30 сек
+  vkRetryTimer = setTimeout(() => refreshStreamData(token), 30000);
+}
+
+// Stub для обратной совместимости
 async function connectVkWs(token) {
   if (vkRetryTimer) { clearTimeout(vkRetryTimer); vkRetryTimer = null; }
-  if (vkWs) { try { vkWs.terminate(); } catch(e) {} vkWs = null; }
-
-  let sd;
-  try { sd = await getVkStreamData(token); }
-  catch(e) {
-    log('getVkStreamData error:', e.message);
-    broadcast({ type: 'STATUS', status: 'offline', message: e.message });
-    vkRetryTimer = setTimeout(() => connectVkWs(token), 30000);
-    return;
-  }
-
-  if (!sd.isOnline) {
-    log('Stream offline');
-    broadcast({ type: 'STATUS', status: 'offline', message: 'Стрим офлайн · чат будет доступен во время трансляции' });
-    vkRetryTimer = setTimeout(() => connectVkWs(token), 30000);
-    return;
-  }
-
-  log('Connecting to Centrifugo, channel:', sd.chatChannel, 'wsToken:', !!sd.wsToken);
-  broadcast({ type: 'STATUS', status: 'connecting' });
-
-  // Передаём cf_protocol_version=v2 как делает браузер VK
-  vkWs = new WebSocket(
-    'wss://centrifugo.live.vkvideo.ru/connection/websocket?cf_protocol_version=v2',
-    { headers: { 'Origin': 'https://live.vkvideo.ru' } }
-  );
-
-  let msgId = 1;
-  const chatChannel = sd.chatChannel;
-
-  vkWs.on('open', () => {
-    log('Centrifugo WS open');
-    vkRetry = 0;
-    // Отправляем connect с токеном (если есть) или без
-    const connectCmd = { connect: {}, id: msgId++ };
-    if (sd.wsToken) connectCmd.connect.token = sd.wsToken;
-    vkWs.send(JSON.stringify(connectCmd));
-  });
-
-  vkWs.on('message', (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-      log('Centrifugo msg:', JSON.stringify(msg).slice(0, 300));
-
-      // Ответ на connect (id=1) — подписываемся на чат
-      if (msg.id === 1 && (msg.connect !== undefined || msg.result !== undefined)) {
-        log('Connected to Centrifugo, subscribing to', chatChannel);
-        vkWs.send(JSON.stringify({ subscribe: { channel: chatChannel }, id: msgId++ }));
-        broadcast({ type: 'STATUS', status: 'connected' });
-        return;
-      }
-
-      // Ответ на subscribe — история
-      if (msg.subscribe !== undefined || (msg.result && msg.result.channel)) {
-        log('Subscribed to', chatChannel);
-        const pubs = msg.subscribe?.publications || msg.result?.publications || [];
-        const messages = pubs.map(p => parseMsg(p?.data)).filter(Boolean);
-        if (messages.length) broadcast({ type: 'HISTORY', messages });
-        return;
-      }
-
-      // Push — новое сообщение
-      // Формат v2: {"push":{"channel":"channel-chat:...","pub":{"data":{...}}}}
-      if (msg.push) {
-        const pub = msg.push?.pub || msg.push?.message;
-        if (pub?.data) {
-          const parsed = parseMsg(pub.data);
-          if (parsed) broadcast({ type: 'MESSAGE', message: parsed });
-        }
-        return;
-      }
-
-      // Fallback
-      handleVkMessage(msg);
-    } catch(e) { log('WS parse error:', e.message); }
-  });
-
-  vkWs.on('close', (code, reason) => {
-    log('Centrifugo closed:', code, reason.toString().slice(0, 100));
-    broadcast({ type: 'STATUS', status: 'reconnecting' });
-    scheduleReconnect(token);
-  });
-
-  vkWs.on('error', (e) => log('Centrifugo error:', e.message));
+  await refreshStreamData(token);
 }
 
 function scheduleReconnect(token) {
