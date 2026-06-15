@@ -199,16 +199,18 @@ app.get('/auth/callback', async (req, res) => {
     const redirectUri = getRedirectUri(req);
     log('Token exchange, redirect_uri:', redirectUri);
 
-    const tokenRes = await fetch(VK_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type:    'authorization_code',
-        code,
-        redirect_uri:  redirectUri,
-        client_id:     VK_CLIENT_ID.trim(),
-        client_secret: VK_CLIENT_SECRET.trim(),
-      }),
+    // VK Video Live использует GET для обмена токена
+    const tokenParams = new URLSearchParams({
+      grant_type:    'authorization_code',
+      code,
+      redirect_uri:  redirectUri,
+      client_id:     VK_CLIENT_ID.trim(),
+      client_secret: VK_CLIENT_SECRET.trim(),
+    });
+    log('Token request URL:', VK_TOKEN_URL + '?' + tokenParams.toString().replace(VK_CLIENT_SECRET, '***'));
+    const tokenRes = await fetch(`${VK_TOKEN_URL}?${tokenParams}`, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' },
     });
 
     const tokenData = await tokenRes.json();
