@@ -63,32 +63,47 @@ async function getVkStreamData(token) {
   if (!r.ok) throw new Error(`VK API ${r.status}`);
   const data = await r.json();
 
-  // Реальная структура ответа (из debug):
-  // wsChatChannel: "channel-chat:2960797"
-  // isOnline: true
-  const chatChannel = data?.wsChatChannel || data?.wsChatSlotChannel;
-  if (!chatChannel) throw new Error('wsChatChannel не найден в ответе API');
+  // Из debug: wsChatChannel = "channel-chat:2960797"
+  const chatChannel = data?.wsChatChannel;
+  if (!chatChannel) throw new Error('wsChatChannel не найден');
 
-  // Получаем WS токен через /ws/connect
+  // Получаем JWT токен для Centrifugo
+  // VK отдаёт его через /v1/ws/connect (POST)
   let wsToken = null;
   try {
     const wsHeaders = { 'Content-Type': 'application/json' };
     if (token) wsHeaders['Authorization'] = `Bearer ${token}`;
-    const wsRes = await fetch(`${VK_API}/ws/connect`, {
-      method: 'POST',
-      headers: wsHeaders,
-      body: JSON.stringify({ channels: [chatChannel] }),
-    });
-    if (wsRes.ok) {
-      const wsData = await wsRes.json();
-      wsToken = wsData?.token || wsData?.data?.token;
-      log('WS token:', wsToken ? 'obtained' : 'not found', '| status:', wsRes.status);
-    } else {
-      log('WS token endpoint status:', wsRes.status);
+
+    // Пробуем несколько эндпоинтов
+    const tokenEndpoints = [
+      `${VK_API}/ws/connect`,
+      `${VK_API}/centrifugo/token`,
+      `${VK_API}/user/public_websocket_token`,
+    ];
+
+    for (const ep of tokenEndpoints) {
+      try {
+        const res = await fetch(ep, {
+          method: 'POST',
+          headers: wsHeaders,
+          body: JSON.stringify({ channels: [chatChannel] }),
+        });
+        log('Token endpoint', ep, 'status:', res.status);
+        if (res.ok) {
+          const d = await res.json();
+          wsToken = d?.token || d?.data?.token || d?.wsToken;
+          if (wsToken) { log('Got WS token from', ep); break; }
+        }
+      } catch(e) { log('Token ep error:', ep, e.message); }
     }
   } catch(e) { log('WS token error:', e.message); }
 
-  return { chatChannel, wsToken, isOnline: !!data?.isOnline, viewers: data?.count?.viewers };
+  return {
+    chatChannel,
+    wsToken,
+    isOnline: !!data?.isOnline,
+    viewers: data?.count?.viewers,
+  };
 }
 
 async function connectVkWs(token) {
@@ -111,43 +126,51 @@ async function connectVkWs(token) {
     return;
   }
 
-  log('Connecting to Centrifugo, channel:', sd.chatChannel, 'viewers:', sd.viewers);
+  log('Connecting to Centrifugo, channel:', sd.chatChannel, 'wsToken:', !!sd.wsToken);
   broadcast({ type: 'STATUS', status: 'connecting' });
 
-  vkWs = new WebSocket('wss://centrifugo.live.vkvideo.ru/connection/websocket');
+  // Передаём cf_protocol_version=v2 как делает браузер VK
+  vkWs = new WebSocket(
+    'wss://centrifugo.live.vkvideo.ru/connection/websocket?cf_protocol_version=v2',
+    { headers: { 'Origin': 'https://live.vkvideo.ru' } }
+  );
+
+  let msgId = 1;
+  const chatChannel = sd.chatChannel;
 
   vkWs.on('open', () => {
-    log('Centrifugo connected');
+    log('Centrifugo WS open');
     vkRetry = 0;
-    // Подключаемся к Centrifugo с токеном (если есть) или без
-    vkWs.send(JSON.stringify({
-      id: 1,
-      connect: sd.wsToken ? { token: sd.wsToken } : {},
-    }));
+    // Отправляем connect с токеном (если есть) или без
+    const connectCmd = { connect: {}, id: msgId++ };
+    if (sd.wsToken) connectCmd.connect.token = sd.wsToken;
+    vkWs.send(JSON.stringify(connectCmd));
   });
 
   vkWs.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
-      log('WS msg:', JSON.stringify(msg).slice(0, 200));
+      log('Centrifugo msg:', JSON.stringify(msg).slice(0, 300));
 
-      // Ответ на connect → подписываемся на канал чата
-      if (msg.id === 1 && msg.connect !== undefined) {
-        vkWs.send(JSON.stringify({ id: 2, subscribe: { channel: sd.chatChannel } }));
+      // Ответ на connect (id=1) — подписываемся на чат
+      if (msg.id === 1 && (msg.connect !== undefined || msg.result !== undefined)) {
+        log('Connected to Centrifugo, subscribing to', chatChannel);
+        vkWs.send(JSON.stringify({ subscribe: { channel: chatChannel }, id: msgId++ }));
         broadcast({ type: 'STATUS', status: 'connected' });
         return;
       }
 
-      // Ответ на subscribe → история сообщений
-      if (msg.id === 2 && msg.subscribe !== undefined) {
-        log('Subscribed to', sd.chatChannel);
-        const pubs = msg.subscribe?.publications || [];
+      // Ответ на subscribe — история
+      if (msg.subscribe !== undefined || (msg.result && msg.result.channel)) {
+        log('Subscribed to', chatChannel);
+        const pubs = msg.subscribe?.publications || msg.result?.publications || [];
         const messages = pubs.map(p => parseMsg(p?.data)).filter(Boolean);
         if (messages.length) broadcast({ type: 'HISTORY', messages });
         return;
       }
 
-      // Входящее сообщение чата (push)
+      // Push — новое сообщение
+      // Формат v2: {"push":{"channel":"channel-chat:...","pub":{"data":{...}}}}
       if (msg.push) {
         const pub = msg.push?.pub || msg.push?.message;
         if (pub?.data) {
@@ -157,13 +180,13 @@ async function connectVkWs(token) {
         return;
       }
 
-      // Fallback — старый формат
+      // Fallback
       handleVkMessage(msg);
     } catch(e) { log('WS parse error:', e.message); }
   });
 
-  vkWs.on('close', (code) => {
-    log('Centrifugo closed:', code);
+  vkWs.on('close', (code, reason) => {
+    log('Centrifugo closed:', code, reason.toString().slice(0, 100));
     broadcast({ type: 'STATUS', status: 'reconnecting' });
     scheduleReconnect(token);
   });
