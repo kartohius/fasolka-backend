@@ -67,7 +67,7 @@ async function getVkStreamData(token) {
   if (!r.ok) throw new Error(`VK API ${r.status}`);
   const data = await r.json();
 
-  const chatChannel = data?.wsChatChannel;
+  const chatChannel = data?.wsChatSlotChannel || data?.wsChatChannel;
   if (!chatChannel) throw new Error('wsChatChannel не найден');
 
   return {
@@ -282,6 +282,46 @@ app.post('/chat/send', async (req, res) => {
     }
     res.json({ ok: true });
   } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ── Токен для Centrifugo (браузер запрашивает перед подключением) ── */
+app.get('/centrifugo/token', async (req, res) => {
+  const sessionId = req.headers['x-session-id'];
+  const session   = sessions.get(sessionId);
+  const token     = session?.accessToken || null;
+
+  try {
+    const headers = { 'User-Agent': 'Mozilla/5.0' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const r = await fetch(`${VK_API}/blog/${VK_CHANNEL}/public_video_stream`, { headers });
+    if (!r.ok) throw new Error('VK API ' + r.status);
+    const data = await r.json();
+    const channel = data?.wsChatSlotChannel || data?.wsChatChannel;
+
+    // Пробуем получить WS JWT токен
+    let wsToken = null;
+    if (token) {
+      try {
+        const tr = await fetch(`${VK_API}/ws/connect`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channels: [channel] }),
+        });
+        log('ws/connect status:', tr.status);
+        if (tr.ok) {
+          const td = await tr.json();
+          log('ws/connect response:', JSON.stringify(td).slice(0, 300));
+          wsToken = td?.token || td?.data?.token || td?.wsToken || td?.accessToken;
+        }
+      } catch(e) { log('ws/connect error:', e.message); }
+    }
+
+    res.json({ token: wsToken, channel, isOnline: !!data?.isOnline });
+  } catch(e) {
+    log('centrifugo/token error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
